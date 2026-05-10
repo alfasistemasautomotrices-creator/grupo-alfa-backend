@@ -5,6 +5,7 @@ Flask + OpenCV + pdf2image + PaddleOCR
 
 import os
 import re
+import gc
 import json
 import uuid
 import zipfile
@@ -15,43 +16,104 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pandas as pd
-from flask import Flask, request, jsonify, send_file, Response, abort
+
+from flask import (
+    Flask,
+    request,
+    jsonify,
+    send_file,
+    Response,
+    abort
+)
+
 from flask_cors import CORS
 from pdf2image import convert_from_bytes
 
-# --- OCR ---------------------------------------------------------------
+# OCR
 from paddleocr import PaddleOCR
 
-# CORREGIDO
-OCR = PaddleOCR(use_angle_cls=True, lang="es")
+# =========================================================
+# OCR
+# =========================================================
 
-# --- Configuración -----------------------------------------------------
+OCR = PaddleOCR(
+    use_angle_cls=True,
+    lang="es"
+)
+
+# =========================================================
+# CONFIG
+# =========================================================
+
 BASE_DIR = Path(__file__).parent
+
 JOBS_DIR = BASE_DIR / "jobs"
 JOBS_DIR.mkdir(exist_ok=True)
 
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
+ALLOWED_ORIGINS = os.environ.get(
+    "ALLOWED_ORIGINS",
+    "*"
+)
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
+
+CORS(
+    app,
+    resources={
+        r"/*": {
+            "origins": ALLOWED_ORIGINS
+        }
+    }
+)
 
 JOBS = {}
 PROGRESS_QUEUES = {}
 
+# =========================================================
+# HELPERS
+# =========================================================
+
 def push_progress(job_id, payload):
+
     q = PROGRESS_QUEUES.get(job_id)
+
     if q is not None:
         q.put(payload)
 
-# --- Detección de bloques ---------------------------------------------
-def detect_product_boxes(img_bgr, min_area_ratio=0.01, max_area_ratio=0.6):
+
+def safe_filename(s):
+
+    return re.sub(
+        r"[^A-Za-z0-9_\-]+",
+        "_",
+        s
+    ).strip("_") or "PIEZA"
+
+
+# =========================================================
+# DETECCIÓN DE BLOQUES
+# =========================================================
+
+def detect_product_boxes(
+    img_bgr,
+    min_area_ratio=0.01,
+    max_area_ratio=0.6
+):
 
     h_img, w_img = img_bgr.shape[:2]
+
     page_area = h_img * w_img
 
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(
+        img_bgr,
+        cv2.COLOR_BGR2GRAY
+    )
 
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    blur = cv2.GaussianBlur(
+        gray,
+        (3, 3),
+        0
+    )
 
     thresh = cv2.adaptiveThreshold(
         blur,
@@ -62,7 +124,10 @@ def detect_product_boxes(img_bgr, min_area_ratio=0.01, max_area_ratio=0.6):
         10
     )
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (5, 5)
+    )
 
     closed = cv2.morphologyEx(
         thresh,
@@ -85,6 +150,7 @@ def detect_product_boxes(img_bgr, min_area_ratio=0.01, max_area_ratio=0.6):
 
         area = w * h
         ratio = area / page_area
+
         aspect = w / float(h) if h else 0
 
         if (
@@ -95,11 +161,20 @@ def detect_product_boxes(img_bgr, min_area_ratio=0.01, max_area_ratio=0.6):
         ):
             boxes.append((x, y, w, h))
 
-    boxes.sort(key=lambda b: (round(b[1] / 50), b[0]))
+    boxes.sort(
+        key=lambda b: (
+            round(b[1] / 50),
+            b[0]
+        )
+    )
 
     return boxes
 
-# --- OCR helpers -------------------------------------------------------
+
+# =========================================================
+# OCR HELPERS
+# =========================================================
+
 PART_RE = re.compile(
     r"\b([A-Z0-9]{2,}[\-\/]?[A-Z0-9]+(?:[\-\/][A-Z0-9]+)*)\b"
 )
@@ -122,11 +197,18 @@ KNOWN_BRANDS = {
     "MOOG",
 }
 
+
 def ocr_block(img_bgr):
 
-    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    rgb = cv2.cvtColor(
+        img_bgr,
+        cv2.COLOR_BGR2RGB
+    )
 
-    result = OCR.ocr(rgb, cls=True)
+    result = OCR.ocr(
+        rgb,
+        cls=True
+    )
 
     lines = []
 
@@ -154,18 +236,21 @@ def ocr_block(img_bgr):
 
         candidate = m.group(1)
 
-        if any(ch.isdigit() for ch in candidate):
-
-            if 4 <= len(candidate) <= 24:
-                part_number = candidate
-                break
+        if (
+            any(ch.isdigit() for ch in candidate)
+            and 4 <= len(candidate) <= 24
+        ):
+            part_number = candidate
+            break
 
     application = ""
 
     for ln in lines:
 
-        if re.search(r"\b(19|20)\d{2}\b", ln):
-
+        if re.search(
+            r"\b(19|20)\d{2}\b",
+            ln
+        ):
             application = ln
             break
 
@@ -179,22 +264,25 @@ def ocr_block(img_bgr):
         "raw_text": full_text,
     }
 
-def safe_filename(s):
 
-    return re.sub(
-        r"[^A-Za-z0-9_\-]+",
-        "_",
-        s
-    ).strip("_") or "PIEZA"
+# =========================================================
+# PIPELINE PRINCIPAL
+# =========================================================
 
-# --- Pipeline principal -----------------------------------------------
-def process_pdf_job(job_id, pdf_bytes, dpi=150):
+def process_pdf_job(
+    job_id,
+    pdf_bytes,
+    dpi=100
+):
 
     job_dir = JOBS_DIR / job_id
 
     images_dir = job_dir / "images"
 
-    images_dir.mkdir(parents=True, exist_ok=True)
+    images_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     try:
 
@@ -204,10 +292,11 @@ def process_pdf_job(job_id, pdf_bytes, dpi=150):
             "status": "Convirtiendo páginas..."
         })
 
+        # MÁS LIGERO PARA RAILWAY
         pages = convert_from_bytes(
             pdf_bytes,
             dpi=dpi,
-            fmt="png",
+            fmt="jpeg",
             thread_count=1
         )
 
@@ -217,10 +306,15 @@ def process_pdf_job(job_id, pdf_bytes, dpi=150):
 
         used_names = set()
 
-        for page_idx, pil_page in enumerate(pages, start=1):
+        for page_idx, pil_page in enumerate(
+            pages,
+            start=1
+        ):
 
             base_progress = (
-                5 + (page_idx - 1) / total_pages * 90
+                5 +
+                (page_idx - 1)
+                / total_pages * 90
             )
 
             push_progress(job_id, {
@@ -237,9 +331,15 @@ def process_pdf_job(job_id, pdf_bytes, dpi=150):
 
             boxes = detect_product_boxes(img)
 
-            for b_idx, (x, y, w, h) in enumerate(boxes, start=1):
+            for b_idx, (x, y, w, h) in enumerate(
+                boxes,
+                start=1
+            ):
 
-                crop = img[y:y+h, x:x+w]
+                crop = img[
+                    y:y+h,
+                    x:x+w
+                ]
 
                 ocr = ocr_block(crop)
 
@@ -248,13 +348,13 @@ def process_pdf_job(job_id, pdf_bytes, dpi=150):
                     f"{safe_filename(ocr['part_number'])}"
                 )
 
-                name = f"{base}.png"
+                name = f"{base}.jpg"
 
                 n = 2
 
                 while name in used_names:
 
-                    name = f"{base}_{n}.png"
+                    name = f"{base}_{n}.jpg"
 
                     n += 1
 
@@ -262,7 +362,11 @@ def process_pdf_job(job_id, pdf_bytes, dpi=150):
 
                 cv2.imwrite(
                     str(images_dir / name),
-                    crop
+                    crop,
+                    [
+                        int(cv2.IMWRITE_JPEG_QUALITY),
+                        85
+                    ]
                 )
 
                 all_parts.append({
@@ -277,12 +381,24 @@ def process_pdf_job(job_id, pdf_bytes, dpi=150):
                     "stage": "ocr",
                     "progress": (
                         base_progress +
-                        (b_idx / max(len(boxes), 1))
-                        * (90 / total_pages)
+                        (
+                            b_idx /
+                            max(len(boxes), 1)
+                        ) * (
+                            90 / total_pages
+                        )
                     ),
                     "status": f"OCR pieza {len(all_parts)}",
                     "detected": len(all_parts),
                 })
+
+            # LIBERAR RAM
+            del img
+            gc.collect()
+
+        # =================================================
+        # ZIP
+        # =================================================
 
         push_progress(job_id, {
             "stage": "zip",
@@ -306,12 +422,20 @@ def process_pdf_job(job_id, pdf_bytes, dpi=150):
                     arcname=p["filename"]
                 )
 
+        # =================================================
+        # CSV
+        # =================================================
+
         csv_path = job_dir / "catalogo.csv"
 
         pd.DataFrame(all_parts).to_csv(
             csv_path,
             index=False
         )
+
+        # =================================================
+        # RESULT
+        # =================================================
 
         result = {
             "job_id": job_id,
@@ -354,10 +478,18 @@ def process_pdf_job(job_id, pdf_bytes, dpi=150):
             "__end__": True
         })
 
-# --- Rutas -------------------------------------------------------------
+
+# =========================================================
+# RUTAS
+# =========================================================
+
 @app.route("/health")
 def health():
-    return {"ok": True}
+
+    return {
+        "ok": True
+    }
+
 
 @app.route("/process-pdf", methods=["POST"])
 def process_pdf():
@@ -400,6 +532,7 @@ def process_pdf():
         "result_url": f"/result/{job_id}"
     })
 
+
 @app.route("/progress/<job_id>")
 def progress_stream(job_id):
 
@@ -413,6 +546,7 @@ def progress_stream(job_id):
         while True:
 
             try:
+
                 evt = q.get(timeout=30)
 
             except queue.Empty:
@@ -431,6 +565,7 @@ def progress_stream(job_id):
         mimetype="text/event-stream"
     )
 
+
 @app.route("/result/<job_id>")
 def get_result(job_id):
 
@@ -448,6 +583,7 @@ def get_result(job_id):
 
     return jsonify(job["result"])
 
+
 @app.route("/download/zip/<job_id>")
 def download_zip(job_id):
 
@@ -461,6 +597,7 @@ def download_zip(job_id):
         as_attachment=True,
         download_name=f"grupo-alfa-{job_id}.zip"
     )
+
 
 @app.route("/download/csv/<job_id>")
 def download_csv(job_id):
@@ -476,6 +613,7 @@ def download_csv(job_id):
         download_name=f"grupo-alfa-{job_id}.csv"
     )
 
+
 @app.route("/image/<job_id>/<path:filename>")
 def get_image(job_id, filename):
 
@@ -486,16 +624,26 @@ def get_image(job_id, filename):
 
     return send_file(
         p,
-        mimetype="image/png"
+        mimetype="image/jpeg"
     )
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 if __name__ == "__main__":
 
-    port = int(os.environ.get("PORT", 5000))
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
+        )
+    )
 
     app.run(
         host="0.0.0.0",
         port=port,
-        debug=True,
+        debug=False,
         threaded=True
-          )
+            )
