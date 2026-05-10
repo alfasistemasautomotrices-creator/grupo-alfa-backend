@@ -205,10 +205,8 @@ def ocr_block(img_bgr):
         cv2.COLOR_BGR2RGB
     )
 
-    result = OCR.ocr(
-        rgb,
-        cls=True
-    )
+    # CORREGIDO
+    result = OCR.ocr(rgb)
 
     lines = []
 
@@ -292,7 +290,6 @@ def process_pdf_job(
             "status": "Convirtiendo páginas..."
         })
 
-        # MÁS LIGERO PARA RAILWAY
         pages = convert_from_bytes(
             pdf_bytes,
             dpi=dpi,
@@ -392,7 +389,6 @@ def process_pdf_job(
                     "detected": len(all_parts),
                 })
 
-            # LIBERAR RAM
             del img
             gc.collect()
 
